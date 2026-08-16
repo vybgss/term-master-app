@@ -670,9 +670,16 @@ html { scroll-behavior: smooth; }
                 <p class="meta" id="checksum" hidden></p>
 
                 <div class="notice" id="gatekeeper" hidden>
-                    <b>Not notarised.</b> Gatekeeper will refuse to open it on the
-                    first try. Right-click the app → <b>Open</b>, then confirm; macOS
-                    remembers the answer.
+                    <b>Not notarised.</b> macOS will refuse to open it the first
+                    time — <b>Apple could not verify “Term Master” is free of
+                    malware</b> — and the dialog offers nothing but Move to Trash.
+                    It is signed, it just has not been through Apple's scanner.
+                    <br><br>
+                    On <b>macOS 15 and later</b>: open System Settings →
+                    Privacy&nbsp;&amp;&nbsp;Security, find the message about Term
+                    Master near the bottom and click <b>Open Anyway</b>.
+                    On <b>macOS 14</b>: Control-click the app and choose
+                    <b>Open</b>. Either way macOS remembers the answer.
                 </div>
 
                 <div class="notice" id="unpublished" hidden>
