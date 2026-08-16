@@ -1,0 +1,1057 @@
+<!doctype html>
+<html lang="en" data-preset="modern-green">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Term Master — a terminal drawn on a cathode ray tube</title>
+<meta name="description" content="Term Master is a macOS terminal emulator rendered through a chain of Metal shaders: barrel distortion, scanlines, aperture mask, phosphor persistence, bloom. Free download.">
+<meta name="color-scheme" content="dark">
+<link rel="icon" href="assets/logo-128.png" type="image/png">
+<link rel="apple-touch-icon" href="assets/logo-512.png">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Term Master">
+<meta property="og:description" content="A terminal emulator drawn as if it were on a cathode ray tube. macOS, free.">
+<meta property="og:image" content="assets/logo-512.png">
+<meta name="twitter:card" content="summary">
+
+<style>
+/* ---------------------------------------------------------------------------
+   The page is the app: one black tube, one phosphor tint, everything drawn in
+   the same monospaced text. Presets below mirror the ones in Settings → Screen,
+   and the tint values are the phosphorTint uniforms straight out of the app.
+   --------------------------------------------------------------------------- */
+
+:root {
+    --mono: "SFMono-Regular", ui-monospace, "SF Mono", Menlo, Consolas,
+            "Liberation Mono", "DejaVu Sans Mono", monospace;
+
+    --bg: #000;
+    --tint: #4dff6b;
+    --fg: #43de5e;
+    --bright: #a6ffb8;
+    --dim: rgba(77, 255, 107, .52);
+    --rule: rgba(77, 255, 107, .22);
+    --fill: rgba(77, 255, 107, .11);
+    --accent: var(--bright);
+
+    --glow: 6px;
+    --scan: .22;          /* scanline strength */
+    --mask: 0;            /* aperture grille strength */
+    --curve: 0;           /* corner rounding / bezel */
+    --flicker: .012;
+    --roll: 0;            /* vertical roll band opacity */
+
+    --row: 1.55rem;
+    --pad: clamp(.9rem, 2.2vw, 2rem);
+    --sidebar: 15.5rem;
+}
+
+/* Green P1 — the full tube. */
+html[data-preset="green"] {
+    --glow: 11px; --scan: .40; --mask: .30; --curve: 1; --flicker: .03; --roll: .05;
+}
+
+/* Amber. */
+html[data-preset="amber"], html[data-preset="modern-amber"] {
+    --tint: #ffb842; --fg: #de9f3a; --bright: #ffd68a;
+    --dim: rgba(255, 184, 66, .52);
+    --rule: rgba(255, 184, 66, .22);
+    --fill: rgba(255, 184, 66, .11);
+}
+html[data-preset="amber"] {
+    --glow: 11px; --scan: .40; --mask: .30; --curve: 1; --flicker: .03; --roll: .05;
+}
+
+/* Colour — a colour tube has no single phosphor, so no tint at all. */
+html[data-preset="colour"], html[data-preset="modern-colour"] {
+    --tint: #e6e6e6; --fg: #bfbfbf; --bright: #e6efec;
+    --dim: rgba(191, 191, 191, .55);
+    --rule: rgba(120, 177, 124, .28);
+    --fill: rgba(120, 177, 124, .13);
+    --accent: #78b17c;
+}
+html[data-preset="colour"] {
+    --glow: 9px; --scan: .34; --mask: .22; --curve: 1; --flicker: .025; --roll: .04;
+}
+
+/* Plain — every effect neutralised bar the saturation. */
+html[data-preset="plain"] {
+    --tint: #e6e6e6; --fg: #bfbfbf; --bright: #e6e6e6;
+    --dim: rgba(191, 191, 191, .55);
+    --rule: rgba(191, 191, 191, .2);
+    --fill: rgba(191, 191, 191, .1);
+    --accent: #bfbfbf;
+    --glow: 0px; --scan: 0; --mask: 0; --curve: 0; --flicker: 0; --roll: 0;
+}
+
+/* Switches in [ SETUP ] — they only ever turn things off. */
+html[data-glow="off"]    { --glow: 0px; }
+html[data-scan="off"]    { --scan: 0; --mask: 0; }
+html[data-motion="off"]  { --flicker: 0; --roll: 0; }
+html[data-bezel="off"]   { --curve: 0; }
+
+* { box-sizing: border-box; }
+
+html { background: var(--bg); }
+
+body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--mono);
+    font-size: clamp(13px, .55vw + 11.4px, 15px);
+    line-height: 1.55;
+    letter-spacing: .01em;
+    text-shadow: 0 0 var(--glow) currentColor;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+}
+
+/* An unlit picture tube is black, and anything that glows builds up from it. */
+body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    background:
+        radial-gradient(120% 90% at 50% 32%,
+            color-mix(in srgb, var(--tint) 7%, transparent) 0%,
+            transparent 70%),
+        var(--bg);
+}
+
+a { color: var(--bright); text-underline-offset: .25em; text-decoration-color: var(--rule); }
+a:hover { text-decoration-color: currentColor; }
+
+:focus-visible { outline: 1px solid var(--bright); outline-offset: 2px; }
+
+/* --- Overlays: scanlines, mask, roll, flicker, vignette ------------------- */
+
+.overlay { position: fixed; inset: 0; pointer-events: none; z-index: 40; }
+
+.overlay.scanlines {
+    opacity: var(--scan);
+    background: repeating-linear-gradient(
+        to bottom,
+        rgba(0, 0, 0, .0) 0px,
+        rgba(0, 0, 0, .0) 1px,
+        rgba(0, 0, 0, .85) 2px,
+        rgba(0, 0, 0, .85) 3px);
+}
+
+.overlay.mask {
+    opacity: var(--mask);
+    mix-blend-mode: multiply;
+    background: repeating-linear-gradient(
+        to right,
+        rgba(255, 0, 0, .18) 0px,
+        rgba(0, 255, 0, .18) 1px,
+        rgba(0, 0, 255, .18) 2px,
+        rgba(0, 0, 0, .30) 3px);
+}
+
+.overlay.vignette {
+    background:
+        radial-gradient(130% 110% at 50% 50%,
+            transparent 55%,
+            rgba(0, 0, 0, .55) 88%,
+            rgba(0, 0, 0, .9) 100%);
+}
+
+.overlay.roll {
+    opacity: var(--roll);
+    background: linear-gradient(to bottom,
+        transparent 0%,
+        color-mix(in srgb, var(--tint) 55%, transparent) 45%,
+        transparent 100%);
+    height: 22vh;
+    inset: auto 0 auto 0;
+    animation: roll 11s linear infinite;
+}
+
+.overlay.flicker {
+    background: color-mix(in srgb, var(--tint) 40%, transparent);
+    opacity: 0;
+    animation: flicker 4.5s steps(2, end) infinite;
+}
+
+@keyframes roll { from { transform: translateY(-25vh); } to { transform: translateY(105vh); } }
+@keyframes flicker {
+    0%, 96%, 100% { opacity: 0; }
+    97%           { opacity: var(--flicker); }
+    98%           { opacity: 0; }
+    99%           { opacity: calc(var(--flicker) * .6); }
+}
+
+/* The bezel: a real barrel would bend the text, so the tube is suggested with
+   a rounded frame and light pooling in the corners instead. */
+.bezel {
+    position: relative;
+    min-height: 100vh;
+    border-radius: calc(var(--curve) * 22px);
+    box-shadow: inset 0 0 calc(var(--curve) * 160px) rgba(0, 0, 0, .95);
+}
+
+/* --- Chrome -------------------------------------------------------------- */
+
+.chrome {
+    position: sticky;
+    top: 0;
+    z-index: 30;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: .55rem var(--pad);
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: blur(2px);
+    border-bottom: 1px solid var(--rule);
+    font-size: .9em;
+}
+
+.chrome-group { display: flex; gap: .1rem; flex-wrap: wrap; }
+
+.btn {
+    appearance: none;
+    background: none;
+    border: 0;
+    padding: .18rem .4rem;
+    margin: 0;
+    color: var(--dim);
+    font: inherit;
+    text-shadow: inherit;
+    cursor: pointer;
+    white-space: nowrap;
+}
+.btn:hover, .btn[aria-expanded="true"] { color: var(--bright); background: var(--fill); }
+
+/* --- Frame: sidebar + screen --------------------------------------------- */
+
+.frame { display: flex; align-items: flex-start; }
+
+.sidebar {
+    position: sticky;
+    top: 2.9rem;
+    flex: 0 0 var(--sidebar);
+    width: var(--sidebar);
+    align-self: flex-start;
+    padding: 1rem 0 2rem;
+    border-right: 1px solid var(--rule);
+    font-size: .92em;
+}
+
+.sidebar h2 {
+    margin: 0 0 .6rem;
+    padding: 0 .9rem;
+    font: inherit;
+    font-weight: normal;
+    color: var(--dim);
+}
+
+.sidebar ol { list-style: none; margin: 0; padding: 0; }
+
+.tab {
+    display: block;
+    width: 100%;
+    text-align: left;
+    padding: .1rem .9rem;
+    line-height: var(--row);
+    color: var(--dim);
+    text-decoration: none;
+    white-space: pre;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.tab:hover { color: var(--bright); }
+.tab[aria-current="true"] { color: var(--bright); background: var(--fill); }
+
+.screen {
+    flex: 1 1 auto;
+    min-width: 0;
+    padding: 0 var(--pad) 4rem;
+}
+
+/* --- Sections ------------------------------------------------------------ */
+
+section { padding: 3.4rem 0 1rem; max-width: 66rem; scroll-margin-top: 4rem; }
+section + section { border-top: 1px solid var(--rule); }
+
+h1, h2, h3 { font: inherit; font-weight: normal; margin: 0; }
+
+.prompt { color: var(--dim); margin: 0 0 1.4rem; }
+.prompt b { font-weight: normal; color: var(--bright); }
+
+h2.heading { color: var(--bright); margin: 0 0 1.2rem; letter-spacing: .12em; }
+
+p { margin: 0 0 1rem; max-width: 60ch; }
+.muted { color: var(--dim); }
+.bright { color: var(--bright); }
+
+ul.out { list-style: none; margin: 0 0 1.2rem; padding: 0; max-width: 62ch; }
+ul.out li { padding-left: 2.2ch; text-indent: -2.2ch; }
+ul.out li::before { content: "· "; color: var(--dim); }
+
+kbd {
+    font: inherit;
+    color: var(--bright);
+    white-space: nowrap;
+}
+
+/* --- Hero ---------------------------------------------------------------- */
+
+.hero { padding-top: 2.6rem; }
+
+.hero-top { display: flex; align-items: center; gap: 1.4rem; flex-wrap: wrap; }
+
+.hero img {
+    width: 92px; height: 92px;
+    image-rendering: auto;
+    filter: drop-shadow(0 0 18px color-mix(in srgb, var(--tint) 45%, transparent));
+}
+
+h1 {
+    font-size: clamp(1.9rem, 5.6vw, 3.3rem);
+    line-height: 1.1;
+    letter-spacing: .18em;
+    color: var(--bright);
+    text-shadow: 0 0 calc(var(--glow) * 2.2) currentColor;
+}
+
+.tagline { font-size: 1.05em; margin: 1.6rem 0 2rem; max-width: 52ch; }
+
+.demo {
+    border: 1px solid var(--rule);
+    padding: 1rem 1.1rem;
+    margin: 0 0 2rem;
+    max-width: 62ch;
+    min-height: 9.6rem;
+    overflow-x: auto;
+}
+/* pre-wrap on the lines rather than the box: the box holds one element per
+   line and the newlines between them in the markup are not text. */
+.demo .line { display: block; white-space: pre-wrap; }
+.demo .line[hidden] { display: none; }
+
+.caret {
+    display: inline-block;
+    width: .62em;
+    height: 1.05em;
+    margin-bottom: -.18em;
+    background: var(--bright);
+    box-shadow: 0 0 var(--glow) var(--bright);
+    animation: blink 1.06s steps(1, end) infinite;
+}
+@keyframes blink { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }
+
+/* --- Download button ----------------------------------------------------- */
+
+.get { display: flex; align-items: center; gap: 1.2rem; flex-wrap: wrap; margin: 0 0 1rem; }
+
+.download {
+    display: inline-block;
+    padding: .6rem 1.5rem;
+    border: 1px solid var(--fg);
+    color: var(--bright);
+    text-decoration: none;
+    letter-spacing: .12em;
+    background: var(--fill);
+    box-shadow: 0 0 calc(var(--glow) * 1.6) color-mix(in srgb, var(--tint) 30%, transparent);
+}
+.download:hover { background: color-mix(in srgb, var(--tint) 22%, transparent); }
+.download[aria-disabled="true"] {
+    border-color: var(--rule);
+    color: var(--dim);
+    background: none;
+    box-shadow: none;
+    cursor: not-allowed;
+}
+
+.meta { color: var(--dim); }
+
+.notice {
+    border: 1px solid var(--rule);
+    border-left-width: 3px;
+    padding: .8rem 1rem;
+    margin: 1.4rem 0;
+    max-width: 62ch;
+    color: var(--dim);
+}
+.notice b { color: var(--bright); font-weight: normal; }
+
+/* --- Tables -------------------------------------------------------------- */
+
+.table { width: 100%; max-width: 62rem; border-collapse: collapse; margin: 0 0 1.6rem; }
+.table th, .table td {
+    text-align: left;
+    vertical-align: top;
+    padding: .34rem 1.2rem .34rem 0;
+    font-weight: normal;
+}
+.table th { color: var(--bright); white-space: nowrap; }
+.table thead th { color: var(--dim); border-bottom: 1px solid var(--rule); padding-bottom: .5rem; }
+.table tbody tr + tr td, .table tbody tr + tr th { border-top: 1px solid color-mix(in srgb, var(--rule) 45%, transparent); }
+
+.presets td:first-child { color: var(--bright); white-space: nowrap; }
+.presets tbody tr { cursor: pointer; }
+.presets tbody tr:hover td { background: var(--fill); }
+.presets tbody tr[data-active="true"] td:first-child::after { content: "  ◂ on screen now"; color: var(--dim); }
+
+/* --- Sheets: [ HOTKEYS ] and [ SETUP ] ----------------------------------- */
+
+.sheet-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 1.2rem;
+    background: rgba(0, 0, 0, .72);
+}
+.sheet-backdrop[data-open="true"] { display: flex; }
+
+.sheet {
+    width: min(52rem, 100%);
+    max-height: 84vh;
+    overflow: auto;
+    padding: 1.2rem 1.4rem 1.6rem;
+    background: var(--bg);
+    border: 1px solid var(--fg);
+    box-shadow: 0 0 40px color-mix(in srgb, var(--tint) 22%, transparent);
+}
+.sheet h2 { color: var(--bright); letter-spacing: .1em; margin-bottom: 1rem; }
+.sheet .close { float: right; }
+
+.setup-group { margin: 0 0 1.4rem; border: 0; padding: 0; }
+.setup-group legend { padding: 0; color: var(--dim); margin-bottom: .5rem; }
+
+.opt {
+    display: block;
+    padding: .2rem .5rem;
+    cursor: pointer;
+    color: var(--dim);
+}
+.opt:hover { color: var(--bright); background: var(--fill); }
+.opt input { position: absolute; opacity: 0; pointer-events: none; }
+.opt input:checked + span { color: var(--bright); }
+.opt input:focus-visible + span { outline: 1px solid var(--bright); outline-offset: 2px; }
+.opt span::before { content: "[ ] "; }
+.opt input:checked + span::before { content: "[x] "; }
+
+/* --- Footer -------------------------------------------------------------- */
+
+footer {
+    border-top: 1px solid var(--rule);
+    padding: 1.4rem var(--pad) 3rem;
+    color: var(--dim);
+    display: flex;
+    gap: 1.2rem;
+    flex-wrap: wrap;
+    justify-content: space-between;
+}
+
+/* --- [ CLOSE ]: the tube goes off ---------------------------------------- */
+
+body.off .bezel, body.off .overlay:not(.vignette) { display: none; }
+
+.power {
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 60;
+    align-items: center;
+    justify-content: center;
+    background: #000;
+}
+body.off .power { display: flex; }
+
+body.off .collapse {
+    position: fixed;
+    inset: 0;
+    z-index: 61;
+    background: var(--bright);
+    animation: collapse .42s ease-in forwards;
+    pointer-events: none;
+}
+@keyframes collapse {
+    0%   { transform: scaleY(1)    scaleX(1);   opacity: .85; }
+    55%  { transform: scaleY(.006) scaleX(1);   opacity: 1; }
+    100% { transform: scaleY(.006) scaleX(.001); opacity: 0; }
+}
+
+/* --- Narrow screens ------------------------------------------------------ */
+
+@media (max-width: 720px) {
+    .frame { display: block; }
+    .sidebar {
+        position: sticky;
+        top: 2.75rem;
+        width: auto;
+        display: flex;
+        gap: .2rem;
+        overflow-x: auto;
+        padding: .35rem var(--pad);
+        border-right: 0;
+        border-bottom: 1px solid var(--rule);
+        background: color-mix(in srgb, var(--bg) 92%, transparent);
+        scrollbar-width: none;
+    }
+    .sidebar h2 { display: none; }
+    .sidebar ol { display: flex; gap: .2rem; }
+    .tab { padding: .1rem .55rem; line-height: 1.9rem; }
+    .tab .num { display: none; }
+    /* Four window buttons and two panels do not fit on one line on a phone,
+       and a chrome bar that wraps onto two is no longer chrome. The three that
+       go are the three a phone has no use for. */
+    .chrome [data-scroll], .chrome [data-zoom], .chrome [data-fullscreen] { display: none; }
+    .hero img { width: 66px; height: 66px; }
+    .screen { padding-bottom: 2.5rem; }
+    .table { display: block; overflow-x: auto; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .overlay.roll, .overlay.flicker, .caret, .collapse { animation: none; }
+    .overlay.roll, .overlay.flicker { display: none; }
+    html { scroll-behavior: auto; }
+}
+
+html { scroll-behavior: smooth; }
+</style>
+</head>
+
+<body>
+
+<div class="bezel">
+
+    <header class="chrome">
+        <div class="chrome-group">
+            <button class="btn" type="button" data-power="off">[ CLOSE ]</button>
+            <button class="btn" type="button" data-scroll="top">[ MIN ]</button>
+            <button class="btn" type="button" data-zoom>[ ZOOM ]</button>
+            <button class="btn" type="button" data-fullscreen>[ FULL ]</button>
+        </div>
+        <div class="chrome-group">
+            <button class="btn" type="button" data-sheet="hotkeys" aria-expanded="false">[ HOTKEYS ]</button>
+            <button class="btn" type="button" data-sheet="setup" aria-expanded="false">[ SETUP ]</button>
+        </div>
+    </header>
+
+    <div class="frame">
+
+        <nav class="sidebar" aria-label="Sections">
+            <h2>[ TABS ]</h2>
+            <ol>
+                <li><a class="tab" href="#term-master"><span class="num"> 1  </span>TERM MASTER</a></li>
+                <li><a class="tab" href="#effects"><span class="num"> 2  </span>EFFECTS</a></li>
+                <li><a class="tab" href="#tabs"><span class="num"> 3  </span>TABS &amp; PANES</a></li>
+                <li><a class="tab" href="#hotkeys-section"><span class="num"> 4* </span>HOTKEYS</a></li>
+                <li><a class="tab" href="#download"><span class="num"> 5  </span>DOWNLOAD</a></li>
+            </ol>
+        </nav>
+
+        <main class="screen">
+
+            <!-- 1 ------------------------------------------------------------ -->
+            <section id="term-master" class="hero">
+                <div class="hero-top">
+                    <img src="assets/logo-512.png" alt="" width="512" height="512">
+                    <h1>TERM&nbsp;MASTER</h1>
+                </div>
+
+                <p class="tagline">A terminal emulator drawn as if it were on a cathode
+                ray tube. Real shell, real pty — the picture is the only thing that
+                is from 1983.</p>
+
+                <div class="demo" id="demo" aria-label="Demonstration">
+                    <span class="line">$ <span id="typed"></span><span class="caret" id="caret"></span></span>
+                    <span class="line" hidden>Darwin · SwiftTerm on a real pty · Metal</span>
+                    <span class="line" hidden>four fragment shaders → one picture tube</span>
+                    <span class="line" hidden>&nbsp;</span>
+                    <span class="line" hidden><span class="bright">[ TABS ]</span> down the left, inside the picture</span>
+                    <span class="line" hidden><span class="bright">[ HOTKEYS ]</span> <span class="bright">[ SETUP ]</span> along the top</span>
+                    <span class="line" hidden>&nbsp;</span>
+                    <span class="line" hidden><span class="muted">ready.</span></span>
+                </div>
+
+                <div class="get">
+                    <a class="download" id="download-top" href="#download">[ DOWNLOAD ]</a>
+                    <span class="meta" id="meta-top">macOS 14 or later · Apple silicon and Intel</span>
+                </div>
+            </section>
+
+            <!-- 2 ------------------------------------------------------------ -->
+            <section id="effects">
+                <p class="prompt">$ <b>term-master --effects</b></p>
+                <h2 class="heading">EFFECTS</h2>
+
+                <p>The terminal itself is
+                <a href="https://github.com/migueldeicaza/SwiftTerm">SwiftTerm</a> —
+                no escape sequence is parsed twice. Its output is captured into a
+                Metal texture, and a chain of four fragment shaders turns it into a
+                picture tube.</p>
+
+                <ul class="out">
+                    <li>barrel distortion · scanlines · aperture, shadow and slot mask</li>
+                    <li>phosphor persistence · bloom · chromatic aberration</li>
+                    <li>vignette · flicker · vertical roll · static and line noise</li>
+                    <li>colour grade</li>
+                </ul>
+
+                <p>Every parameter is adjustable while the terminal is running, in
+                <b class="bright">Settings</b> (<kbd>⌘,</kbd>) under Screen: the preset
+                and the six worth reaching for up front, the other thirty behind
+                <b class="bright">All parameters</b>.</p>
+
+                <p class="muted">The presets below are wired to this page too — pick
+                one and the site changes tube.</p>
+
+                <table class="table presets">
+                    <thead>
+                        <tr><th scope="col">Preset</th><th scope="col">What it is</th></tr>
+                    </thead>
+                    <tbody>
+                        <tr data-preset="plain"><td>Plain</td><td>Every effect neutralised bar the saturation. The terminal with nothing done to it</td></tr>
+                        <tr data-preset="modern-green"><td>Modern Green P1</td><td>Green phosphor on a flat screen. No curvature, no aberration — the default</td></tr>
+                        <tr data-preset="modern-amber"><td>Modern Amber</td><td>The same look in amber</td></tr>
+                        <tr data-preset="green"><td>Green P1</td><td>The full tube: a slight bend, scanlines, aperture grille, phosphor glow</td></tr>
+                        <tr data-preset="amber"><td>Amber</td><td>The full tube, amber phosphor</td></tr>
+                        <tr data-preset="colour"><td>Colour</td><td>No phosphor tint, shadow mask, real ANSI colours</td></tr>
+                    </tbody>
+                </table>
+
+                <p class="muted">Whatever you tune is kept, parameter by parameter, so
+                a value you never touched follows the preset rather than being frozen
+                where it happened to be.</p>
+            </section>
+
+            <!-- 3 ------------------------------------------------------------ -->
+            <section id="tabs">
+                <p class="prompt">$ <b>term-master --tabs</b></p>
+                <h2 class="heading">TABS &amp; PANES</h2>
+
+                <p>The tab list runs down the left-hand side, inside the picture
+                rather than beside it, so it curves and glows with the text. A tab
+                holds one to three terminals side by side, each with its own session,
+                scrollback and working directory. Background tabs keep running.</p>
+
+                <table class="table">
+                    <tbody>
+                        <tr><th scope="row">Splitting</th><td>Up to three panes. A split that would leave them too narrow to read is refused rather than performed badly, and splitting takes no height from the terminal</td></tr>
+                        <tr><th scope="row">Pinned tabs</th><td><kbd>⌘S</kbd> pins how many panes a tab has and where each of them is. It opens that way on every launch, and <kbd>⌘L</kbd> puts it back any time</td></tr>
+                        <tr><th scope="row">Coming back</th><td>Open tabs return with their panes, directories and names. A directory that has gone takes the nearest parent that still exists, and says so on the first line</td></tr>
+                        <tr><th scope="row">Questions</th><td>You are asked only when something is about to be lost — a shell with a program running in it, or a pinned tab. An idle prompt is not worth a question</td></tr>
+                        <tr><th scope="row">Scrollback</th><td>10,000 lines per pane, adjustable. Lines are allocated as output arrives, so a high limit costs nothing until you use it</td></tr>
+                        <tr><th scope="row">iCloud</th><td>Two independent switches: sync the open tabs, sync the screen tuning. Both off by default, both plain readable files — never any terminal output</td></tr>
+                        <tr><th scope="row">Window</th><td>No system title bar. <kbd>[ CLOSE ]</kbd> <kbd>[ MIN ]</kbd> <kbd>[ ZOOM ]</kbd> <kbd>[ FULL ]</kbd> are drawn into the same texture as the text, so they curve and scan with it</td></tr>
+                        <tr><th scope="row">Font</th><td>LiterationMono Nerd Font ships inside the bundle and is registered for that process only. Nothing is installed on your system</td></tr>
+                    </tbody>
+                </table>
+            </section>
+
+            <!-- 4 ------------------------------------------------------------ -->
+            <section id="hotkeys-section">
+                <p class="prompt">$ <b>term-master --hotkeys</b></p>
+                <h2 class="heading">HOTKEYS</h2>
+                <div id="hotkeys-table"></div>
+                <p class="muted"><kbd>[ HOTKEYS ]</kbd> in the top right shows the same
+                list without leaving the terminal.</p>
+            </section>
+
+            <!-- 5 ------------------------------------------------------------ -->
+            <section id="download">
+                <p class="prompt">$ <b>curl -O term-master.zip</b></p>
+                <h2 class="heading">DOWNLOAD</h2>
+
+                <div class="get">
+                    <a class="download" id="download-main" href="downloads/Term-Master.zip" download>[ DOWNLOAD ]</a>
+                    <span class="meta" id="meta-main">macOS 14 or later · Apple silicon and Intel</span>
+                </div>
+
+                <p class="meta" id="checksum" hidden></p>
+
+                <div class="notice" id="gatekeeper" hidden>
+                    <b>Not notarised.</b> Gatekeeper will refuse to open it on the
+                    first try. Right-click the app → <b>Open</b>, then confirm; macOS
+                    remembers the answer.
+                </div>
+
+                <div class="notice" id="unpublished" hidden>
+                    <b>No build published yet.</b> The download appears here as soon as
+                    one is.
+                </div>
+
+                <table class="table">
+                    <tbody>
+                        <tr><th scope="row">1</th><td>Download and unzip</td></tr>
+                        <tr><th scope="row">2</th><td>Drag <b class="bright">Term Master.app</b> into <b class="bright">/Applications</b></td></tr>
+                        <tr><th scope="row">3</th><td>Open it. It runs your <b class="bright">$SHELL</b> on a real pty — nothing to configure</td></tr>
+                    </tbody>
+                </table>
+
+                <p class="muted">The app is not sandboxed, and cannot be: a sandboxed
+                parent hands its sandbox to every shell it launches, and a terminal
+                that cannot reach your files is not a terminal.</p>
+            </section>
+
+        </main>
+    </div>
+
+    <footer>
+        <span id="footer-version">Term Master</span>
+        <span>SwiftTerm · Metal · LiterationMono Nerd Font (SIL OFL 1.1)</span>
+    </footer>
+</div>
+
+<!-- Sheets ---------------------------------------------------------------- -->
+
+<div class="sheet-backdrop" id="sheet-hotkeys" data-open="false" role="dialog" aria-modal="true" aria-label="Hotkeys">
+    <div class="sheet">
+        <button class="btn close" type="button" data-close>[ CLOSE ]</button>
+        <h2>[ HOTKEYS ]</h2>
+        <div id="hotkeys-sheet-table"></div>
+    </div>
+</div>
+
+<div class="sheet-backdrop" id="sheet-setup" data-open="false" role="dialog" aria-modal="true" aria-label="Screen settings">
+    <div class="sheet">
+        <button class="btn close" type="button" data-close>[ CLOSE ]</button>
+        <h2>[ SETUP ]</h2>
+        <p class="muted">The same page, on a different tube. Kept in this browser.</p>
+
+        <fieldset class="setup-group">
+            <legend>Preset</legend>
+            <label class="opt"><input type="radio" name="preset" value="plain"><span>Plain</span></label>
+            <label class="opt"><input type="radio" name="preset" value="modern-green"><span>Modern Green P1</span></label>
+            <label class="opt"><input type="radio" name="preset" value="modern-amber"><span>Modern Amber</span></label>
+            <label class="opt"><input type="radio" name="preset" value="modern-colour"><span>Modern Colour</span></label>
+            <label class="opt"><input type="radio" name="preset" value="green"><span>Green P1</span></label>
+            <label class="opt"><input type="radio" name="preset" value="amber"><span>Amber</span></label>
+            <label class="opt"><input type="radio" name="preset" value="colour"><span>Colour</span></label>
+        </fieldset>
+
+        <fieldset class="setup-group">
+            <legend>Screen</legend>
+            <label class="opt"><input type="checkbox" data-switch="glow" checked><span>Glow</span></label>
+            <label class="opt"><input type="checkbox" data-switch="scan" checked><span>Scanlines and mask</span></label>
+            <label class="opt"><input type="checkbox" data-switch="motion" checked><span>Flicker and roll</span></label>
+            <label class="opt"><input type="checkbox" data-switch="bezel" checked><span>Bezel</span></label>
+        </fieldset>
+
+        <p class="muted">Restoring the preset puts back whatever you have pulled
+        apart — in the app as well as here.</p>
+        <button class="btn" type="button" data-restore>[ RESTORE THIS PRESET ]</button>
+    </div>
+</div>
+
+<div class="power" id="power">
+    <button class="btn" type="button" data-power="on" style="color: var(--fg); font-size: 1.1em;">[ POWER ON ]</button>
+</div>
+
+<div class="overlay scanlines"></div>
+<div class="overlay mask"></div>
+<div class="overlay roll"></div>
+<div class="overlay flicker"></div>
+<div class="overlay vignette"></div>
+
+<script>
+(function () {
+    "use strict";
+
+    var root = document.documentElement;
+    var reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    /* --- Release manifest ------------------------------------------------
+       Written by Scripts/publish.sh in the app repository. The download link
+       is a plain href in the markup, so it works with this fetch failing; all
+       this adds is the version, the size and the checksum. */
+
+    function fmtDate(iso) {
+        var d = new Date(iso);
+        if (isNaN(d)) { return iso; }
+        return d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+    }
+
+    fetch("releases.json", { cache: "no-cache" })
+        .then(function (r) { if (!r.ok) { throw new Error(r.status); } return r.json(); })
+        .then(function (rel) {
+            var label = "Version " + rel.version + " (" + rel.build + ")";
+            var meta = label +
+                " · " + (rel.size || "") +
+                " · macOS " + (rel.minimumSystemVersion || "14.0") + " or later" +
+                " · " + (rel.architectures || "Apple silicon and Intel");
+
+            document.getElementById("meta-top").textContent = meta;
+            document.getElementById("meta-main").textContent = meta;
+            document.getElementById("footer-version").textContent =
+                "Term Master " + rel.version + " (" + rel.build + ")" +
+                (rel.published ? " · " + fmtDate(rel.published) : "");
+
+            if (rel.file) { document.getElementById("download-main").href = rel.file; }
+
+            if (rel.sha256) {
+                var sum = document.getElementById("checksum");
+                sum.textContent = "sha256  " + rel.sha256;
+                sum.hidden = false;
+            }
+
+            if (rel.notarized === false) {
+                document.getElementById("gatekeeper").hidden = false;
+            }
+        })
+        .catch(function () {
+            /* No manifest: nothing has been published into this repository yet. */
+            var main = document.getElementById("download-main");
+            main.setAttribute("aria-disabled", "true");
+            main.removeAttribute("href");
+            document.getElementById("unpublished").hidden = false;
+        });
+
+    /* --- Hotkeys ---------------------------------------------------------- */
+
+    var HOTKEYS = [
+        ["⌘T",      "New tab below the current one, and switch to it"],
+        ["⇧⌘T",     "New tab below the current one, and stay where you are"],
+        ["⌘↑ ⌘↓",   "Move up and down the list, wrapping at both ends"],
+        ["⇧⌘↑ ⇧⌘↓", "Move the current tab up or down, stopping at the ends"],
+        ["⌘D",      "Split the tab — another terminal beside this one, up to three"],
+        ["⇧⌘D",     "Close this pane; never the last one, which is what ⌘W is for"],
+        ["⌘← ⌘→",   "Move between the panes, wrapping at both ends"],
+        ["⇧⌘← ⇧⌘→", "Move the current pane left or right, stopping at the ends"],
+        ["⌘R",      "Rename the tab — type in place, ⏎ to keep, ⎋ to abandon"],
+        ["⌘S",      "Pin the tab to the panes it has now — always saves, never undoes"],
+        ["⇧⌘S",     "Take the pin off"],
+        ["⌘L",      "Put the pinned panes back, wherever they have got to"],
+        ["⌘W",      "Close the tab and every pane in it"],
+        ["⌘K",      "Clear the screen and the scrollback"],
+        ["⌘,",      "Settings"]
+    ];
+
+    function hotkeyTable() {
+        var rows = HOTKEYS.map(function (k) {
+            var tr = document.createElement("tr");
+            var th = document.createElement("th");
+            th.scope = "row";
+            th.appendChild(document.createElement("kbd")).textContent = k[0];
+            var td = document.createElement("td");
+            td.textContent = k[1];
+            tr.appendChild(th);
+            tr.appendChild(td);
+            return tr;
+        });
+        var table = document.createElement("table");
+        table.className = "table";
+        var body = document.createElement("tbody");
+        rows.forEach(function (r) { body.appendChild(r); });
+        table.appendChild(body);
+        return table;
+    }
+
+    document.getElementById("hotkeys-table").appendChild(hotkeyTable());
+    document.getElementById("hotkeys-sheet-table").appendChild(hotkeyTable());
+
+    /* --- Sheets ----------------------------------------------------------- */
+
+    var openSheet = null;
+
+    function setSheet(name, open) {
+        var el = document.getElementById("sheet-" + name);
+        var btn = document.querySelector('[data-sheet="' + name + '"]');
+        if (!el) { return; }
+        el.setAttribute("data-open", open ? "true" : "false");
+        if (btn) { btn.setAttribute("aria-expanded", open ? "true" : "false"); }
+        openSheet = open ? name : null;
+        if (open) {
+            var focusable = el.querySelector("button, input, a");
+            if (focusable) { focusable.focus(); }
+        } else if (btn) {
+            btn.focus();
+        }
+    }
+
+    document.querySelectorAll("[data-sheet]").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+            var name = btn.getAttribute("data-sheet");
+            setSheet(name, openSheet !== name);
+        });
+    });
+
+    document.querySelectorAll(".sheet-backdrop").forEach(function (back) {
+        back.addEventListener("click", function (e) {
+            if (e.target === back || e.target.hasAttribute("data-close")) {
+                setSheet(back.id.replace("sheet-", ""), false);
+            }
+        });
+    });
+
+    document.addEventListener("keydown", function (e) {
+        if (e.key === "Escape" && openSheet) { setSheet(openSheet, false); }
+    });
+
+    /* --- Presets and switches --------------------------------------------- */
+
+    var STORE = "term-master.screen";
+    var DEFAULTS = { preset: "modern-green", glow: true, scan: true, motion: true, bezel: true };
+    var state = Object.assign({}, DEFAULTS);
+
+    try {
+        var saved = JSON.parse(localStorage.getItem(STORE) || "{}");
+        Object.keys(DEFAULTS).forEach(function (k) {
+            if (saved[k] !== undefined) { state[k] = saved[k]; }
+        });
+    } catch (e) { /* a browser that will not store is not a reason to fail */ }
+
+    function apply() {
+        root.setAttribute("data-preset", state.preset);
+        ["glow", "scan", "motion", "bezel"].forEach(function (k) {
+            root.setAttribute("data-" + k, state[k] ? "on" : "off");
+        });
+
+        document.querySelectorAll('input[name="preset"]').forEach(function (input) {
+            input.checked = input.value === state.preset;
+        });
+        document.querySelectorAll("[data-switch]").forEach(function (input) {
+            input.checked = !!state[input.getAttribute("data-switch")];
+        });
+        document.querySelectorAll(".presets tbody tr").forEach(function (tr) {
+            tr.setAttribute("data-active",
+                tr.getAttribute("data-preset") === state.preset ? "true" : "false");
+        });
+
+        try { localStorage.setItem(STORE, JSON.stringify(state)); } catch (e) {}
+    }
+
+    document.querySelectorAll('input[name="preset"]').forEach(function (input) {
+        input.addEventListener("change", function () {
+            state.preset = input.value;
+            apply();
+        });
+    });
+
+    document.querySelectorAll("[data-switch]").forEach(function (input) {
+        input.addEventListener("change", function () {
+            state[input.getAttribute("data-switch")] = input.checked;
+            apply();
+        });
+    });
+
+    document.querySelectorAll(".presets tbody tr").forEach(function (tr) {
+        tr.addEventListener("click", function () {
+            state.preset = tr.getAttribute("data-preset");
+            state.glow = state.scan = state.motion = state.bezel = true;
+            apply();
+        });
+    });
+
+    var restore = document.querySelector("[data-restore]");
+    if (restore) {
+        restore.addEventListener("click", function () {
+            var preset = state.preset;
+            state = Object.assign({}, DEFAULTS, { preset: preset });
+            apply();
+        });
+    }
+
+    apply();
+
+    /* --- Chrome buttons --------------------------------------------------- */
+
+    document.querySelector("[data-zoom]").addEventListener("click", function () {
+        var wide = root.getAttribute("data-zoomed") === "true";
+        root.setAttribute("data-zoomed", wide ? "false" : "true");
+        root.style.setProperty("--sidebar", wide ? "15.5rem" : "9.5rem");
+    });
+
+    document.querySelector("[data-fullscreen]").addEventListener("click", function () {
+        if (document.fullscreenElement) {
+            document.exitFullscreen();
+        } else if (document.documentElement.requestFullscreen) {
+            document.documentElement.requestFullscreen().catch(function () {});
+        }
+    });
+
+    document.querySelector('[data-scroll="top"]').addEventListener("click", function () {
+        window.scrollTo({ top: 0, behavior: reduced ? "auto" : "smooth" });
+    });
+
+    /* [ CLOSE ] switches the tube off, the way it does when you unplug a CRT.
+       Nothing is lost by it and [ POWER ON ] brings it straight back. */
+    document.querySelectorAll("[data-power]").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+            if (btn.getAttribute("data-power") === "off") {
+                if (!reduced) {
+                    var flash = document.createElement("div");
+                    flash.className = "collapse";
+                    document.body.appendChild(flash);
+                    setTimeout(function () { flash.remove(); }, 500);
+                }
+                document.body.classList.add("off");
+                setTimeout(function () { document.getElementById("power")
+                    .querySelector("button").focus(); }, 60);
+            } else {
+                document.body.classList.remove("off");
+            }
+        });
+    });
+
+    /* --- Which tab is lit -------------------------------------------------- */
+
+    var tabs = Array.prototype.slice.call(document.querySelectorAll(".tab"));
+    var sections = tabs.map(function (t) {
+        return document.getElementById(t.getAttribute("href").slice(1));
+    });
+
+    function lit() {
+        var line = window.scrollY + window.innerHeight * 0.28;
+        var current = 0;
+        sections.forEach(function (s, i) {
+            if (s && s.offsetTop <= line) { current = i; }
+        });
+        tabs.forEach(function (t, i) {
+            if (i === current) {
+                t.setAttribute("aria-current", "true");
+            } else {
+                t.removeAttribute("aria-current");
+            }
+        });
+    }
+
+    var ticking = false;
+    window.addEventListener("scroll", function () {
+        if (ticking) { return; }
+        ticking = true;
+        requestAnimationFrame(function () { lit(); ticking = false; });
+    }, { passive: true });
+    window.addEventListener("resize", lit);
+    lit();
+
+    /* --- The typed line ---------------------------------------------------- */
+
+    var typed = document.getElementById("typed");
+    var lines = Array.prototype.slice.call(document.querySelectorAll("#demo .line")).slice(1);
+    var command = 'open -a "Term Master"';
+
+    function reveal() {
+        lines.forEach(function (l, i) {
+            setTimeout(function () { l.hidden = false; }, reduced ? 0 : 180 * (i + 1));
+        });
+    }
+
+    if (reduced) {
+        typed.textContent = command;
+        reveal();
+    } else {
+        var i = 0;
+        (function type() {
+            if (i <= command.length) {
+                typed.textContent = command.slice(0, i);
+                i += 1;
+                setTimeout(type, 55 + Math.random() * 45);
+            } else {
+                setTimeout(reveal, 350);
+            }
+        })();
+    }
+}());
+</script>
+</body>
+</html>
