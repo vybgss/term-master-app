@@ -1,0 +1,12 @@
+{
+    "version": "1.0",
+    "build": "57",
+    "label": "1.0 (57)",
+    "file": "downloads/Term-Master.zip",
+    "bytes": 8966888,
+    "size": "8.6 MB",
+    "sha256": "3ceea1e5581cdb4efc6471dcede831a717b3086cab8354d1c254860dc4b32ef7",
+    "published": "2026-08-16",
+    "minimumSystemVersion": "14.0",
+    "architectures": "Apple silicon and Intel"
+}
