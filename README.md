@@ -11,6 +11,9 @@ by GitHub Pages, and the place the built app is downloaded from.
 | `downloads/archive/` | Earlier builds, only when published with `--keep` |
 | `releases.json` | Version, build, size, checksum and date of what is in `downloads/` |
 
+Everything published here is notarised and stapled — `publish.sh` refuses to
+copy in a build that is not, because macOS refuses to open one.
+
 ## Publishing a build
 
 From the app repository next door:
