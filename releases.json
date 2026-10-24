@@ -1,12 +1,12 @@
 {
     "version": "1.1",
-    "build": "63",
-    "label": "1.1 (63)",
+    "build": "64",
+    "label": "1.1 (64)",
     "file": "downloads/Term-Master.dmg",
-    "bytes": 10631714,
-    "size": "10.1 MB",
-    "sha256": "cc78e4ff6c3c2ad6178a484589db64d85f4caf88439a34128fbf2cb906e9f9ae",
-    "published": "2026-08-21",
+    "bytes": 10790558,
+    "size": "10.3 MB",
+    "sha256": "2637374d14a28ff996f85673fa5c792bbf338c45963d2264057f8cd70dca4e95",
+    "published": "2026-10-24",
     "minimumSystemVersion": "14.0",
     "architectures": "Apple silicon and Intel"
 }
